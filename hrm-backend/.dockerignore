@@ -1,0 +1,36 @@
+# Ignore node_modules and other dependencies
+node_modules
+npm-debug.log
+yarn-error.log
+
+# Ignore build directories
+dist
+build
+
+# Ignore logs
+logs
+*.log
+
+# Ignore Docker files
+Dockerfile
+docker-compose.yml
+
+# Ignore IDE/editor config files
+.vscode
+.idea
+*.swp
+
+# Ignore test files
+coverage
+*.test.js
+*.spec.js
+
+mlmt-map.docker.tar
+deploy.*
+
+# Additional files to ignore
+.git
+.gitignore
+*.md
+test
+__tests__

@@ -1,0 +1,754 @@
+import * as tj from '@tmcw/togeojson';
+import { F, Folder } from '@tmcw/togeojson';
+import * as csv from 'csv-parse/sync';
+import { GeoJsonProperties, Geometry } from 'geojson';
+import JSZip from 'jszip';
+import { MemoryStorageFile } from 'nest-file-fastify';
+import * as path from 'path';
+import { Stream } from 'stream';
+import * as unzipper from 'unzipper';
+import * as XLSX from 'xlsx';
+import { DOMParser } from 'xmldom';
+import { UserObjectDetail } from '../../user-object-detail/model';
+import { UserObject } from '../../user-object/model';
+import { SmartFeatureArnoTypeEnum, SmartFeatureArnpTypeEnum, UserObjectType } from './enum.util';
+import { getKmlStyleColors } from './geojson.util';
+import * as gdal from 'gdal-async';
+import { v4 as uuidv4 } from 'uuid';
+import * as fs from 'fs-extra';
+
+export interface IFile {
+    id: string;
+    name: string;
+    parentId?: string;
+    type?: Geometry['type'];
+    data?: F;
+    description?: {
+        type: string;
+        value: string;
+    };
+}
+
+export type IFeature = F & {
+    id: string;
+    parentId?: string;
+    name: string;
+};
+
+export type ISystemObject = {
+    id: string;
+    parentId?: string;
+    name: string;
+    type: string;
+    root: string;
+    data: any;
+};
+
+export type ISystemObjectDetail = {
+    id: string;
+    parentId?: string;
+    name: string;
+    type: string;
+    data: any;
+};
+
+export interface IFolder {
+    id: string;
+    name: string;
+    children: IFolder[];
+    files: IFile[];
+}
+
+export interface IGeoJson {
+    name: string;
+    folders: IFolder[];
+    features: IFeature[];
+    styles?: Record<string, number[]>;
+}
+
+export const getKmlFolders = (data: Folder | F): IFolder | undefined => {
+    if (data.type == 'folder') {
+        const folderId = String(data.meta?.name || 'United_Folder_' + Math.random());
+        return {
+            name: String(data.meta?.name || 'United Folder'),
+            id: folderId,
+            children: data.children
+                .filter((f) => f && f.type == 'folder')
+                .map((f) => getKmlFolders(f as Folder))
+                .filter((f) => f !== undefined),
+            files: data.children
+                .filter((f) => f.type == 'Feature')
+                .map((f) => ({
+                    id: String(f.id || f.properties?.name || 'United_Feature_' + Math.random()),
+                    name: String(f.properties?.name || 'United Layer'),
+                    parentId: folderId,
+                    data: f,
+                })),
+        };
+    }
+};
+
+export const convertToTreeFolders = (data: IFolder): IFolder => {
+    return {
+        ...data,
+        children: data.children.map(convertToTreeFolders),
+        files: [],
+    };
+};
+
+export const getKmlGeoJsonLayer = (parent: IFolder): IFeature[] => {
+    const features = [] as IFeature[];
+    if (parent.children) {
+        features.push(...parent.children.map(getKmlGeoJsonLayer).flat());
+    }
+    features.push(
+        ...parent.files
+            .map(({ data = {} as F, ...f }) => ({
+                ...f,
+                ...data,
+                id: f.id,
+            }))
+            .flat(),
+    );
+    return features;
+};
+
+const convertStringKmlToMyObject = (content: string, folderId = 'root') => {
+    const parser = new DOMParser();
+    const kml = parser.parseFromString(content, 'text/xml');
+
+    const styles = getKmlStyleColors(kml);
+    const geoFolder = tj.kmlWithFolders(kml);
+    const folderRoot = {
+        name: 'root',
+        id: 'root',
+        children: geoFolder.children
+            .filter((f) => f && f.type == 'folder')
+            .map((f) => getKmlFolders(f as Folder))
+            .filter((f) => f !== undefined),
+        files: geoFolder.children
+            .filter((f) => f.type == 'Feature')
+            .map((f) => ({
+                id: String(f.id || f.properties?.name || 'United_Feature_' + Math.random()),
+                name: String(f.properties?.name || 'United Layer'),
+                parentId: 'root',
+                data: f,
+            })),
+    };
+    const featureRoot = geoFolder.children
+        .filter((f) => f.type === 'Feature')
+        .map(({ ...f }) => ({
+            ...f,
+            id: String(f.id || f.properties?.name || 'United_Feature_' + Math.random()),
+            name: String(f.properties?.name || 'United Layer'),
+            parentId: folderId,
+        }))
+        .flat();
+
+    return {
+        folders: [convertToTreeFolders(folderRoot)],
+        features: [...featureRoot, ...folderRoot.children.map((f) => getKmlGeoJsonLayer(f)).flat()],
+        styles,
+    };
+};
+
+export const convertFileKMLToGeoJSON = (file: MemoryStorageFile): Promise<IGeoJson> => {
+    return new Promise((resolve) =>
+        resolve({
+            name: file.originalFilename,
+            ...convertStringKmlToMyObject(new TextDecoder().decode(file.buffer)),
+        }),
+    );
+};
+
+export const convertFileKMZToGeoJSON = (file: MemoryStorageFile): Promise<IGeoJson> => {
+    return new Promise((resolve, reject) => {
+        const zip = new JSZip();
+        zip.loadAsync(file.buffer).then((zip) => {
+            const kmlFile = Object.values(zip.files).find((f) => f.name.endsWith('.kml'));
+            if (!kmlFile) {
+                reject(new Error('KML file not found in KMZ'));
+                return;
+            }
+            kmlFile.async('text').then((content) =>
+                resolve({
+                    name: file.originalFilename,
+                    ...convertStringKmlToMyObject(content),
+                }),
+            );
+        });
+    });
+};
+
+export const convertFileCSVToGeoJSON = (file: MemoryStorageFile): Promise<IGeoJson> => {
+    return new Promise((resolve, reject) => {
+        try {
+            const csvContent = new TextDecoder().decode(file.buffer);
+
+            const records = csv.parse(csvContent, {
+                columns: (header: string[]) => header.map((h) => h.toLowerCase()),
+                skip_empty_lines: true,
+            });
+
+            resolve({
+                name: String(file.originalFilename || 'United_Folder'),
+                folders: [
+                    {
+                        name: 'root',
+                        id: 'root',
+                        children: [],
+                        files: [],
+                    },
+                ],
+                features: records.map((f: any, index: any) => {
+                    const childId = String(f.name || 'United_Folder_' + index);
+                    return {
+                        id: childId,
+                        parentId: 'root',
+                        name: String(f.name || 'United_Folder'),
+                        geometry: parseGeometryWKT(f.geometry),
+                        properties: {
+                            name: String(f.name || 'United_Folder'),
+                            value: f.value,
+                        },
+                    };
+                }),
+                styles: {},
+            });
+        } catch (error) {
+            reject(error);
+        }
+    });
+};
+
+export const convertFileXLSXToGeoJSON = (file: MemoryStorageFile): Promise<IGeoJson> => {
+    return new Promise((resolve, reject) => {
+        try {
+            const workbook = XLSX.read(file.buffer, { type: 'buffer' });
+            const sheetName = workbook.SheetNames[0];
+
+            const worksheet = workbook.Sheets[sheetName];
+
+            const csvData = XLSX.utils.sheet_to_csv(worksheet);
+            const records = csv.parse(csvData, {
+                columns: (header: string[]) => header.map((h) => h.toLowerCase()),
+                skip_empty_lines: true,
+            });
+            resolve({
+                name: String(file.originalFilename || 'United_Folder'),
+                folders: [
+                    {
+                        name: 'root',
+                        id: 'root',
+                        children: [],
+                        files: [],
+                    },
+                ],
+                features: records.map((f: any, index: any) => {
+                    const childId = String(f.name || 'United_Folder_' + index);
+                    return {
+                        id: childId,
+                        parentId: 'root',
+                        name: String(f.name || 'United_Folder'),
+                        geometry: parseGeometryWKT(f.geometry),
+                        properties: {
+                            name: String(f.name || 'United_Folder'),
+                            value: f.value,
+                        },
+                    };
+                }),
+                styles: {},
+            });
+        } catch (error) {
+            reject(error);
+        }
+    });
+};
+
+export const convertFileTabToGeoJSON = (file: MemoryStorageFile): Promise<IGeoJson[]> => {
+    return new Promise(async (resolve, reject) => {
+        try {
+            const tempDir = path.join(__dirname, 'temp', uuidv4());
+            await fs.ensureDir(tempDir);
+            const associatedExtensions = ['.dat', '.map', '.id', '.ind'];
+            const geoJsons: IGeoJson[] = [];
+
+            // Handle ZIP file
+            if (file.originalFilename.toLowerCase().endsWith('.zip')) {
+                const directory = await unzipper.Open.buffer(file.buffer);
+                const tabFiles = directory.files.filter((f) => f.path.toLowerCase().endsWith('.tab'));
+
+                if (tabFiles.length === 0) {
+                    throw new Error('No TAB files found in ZIP');
+                }
+
+                console.log(
+                    `Extracting ZIP: ${file.originalFilename}, found TAB files:`,
+                    tabFiles.map((f) => f.path),
+                );
+
+                // Extract all files to temp directory
+                for (const zipFile of directory.files) {
+                    const filePath = path.join(tempDir, zipFile.path);
+                    await fs.ensureDir(path.dirname(filePath));
+                    const content = await zipFile.buffer();
+                    await fs.writeFile(filePath, content);
+                }
+
+                // Process each TAB file
+                for (const tabFile of tabFiles) {
+                    const tabFilePath = path.join(tempDir, tabFile.path);
+                    const tabBaseName = path.basename(tabFile.path, '.tab');
+
+                    // Check for associated files
+                    const associatedFiles = directory.files.filter((f) =>
+                        associatedExtensions.some(
+                            (ext) => f.path.toLowerCase() === `${tabBaseName.toLowerCase()}${ext}`,
+                        ),
+                    );
+                    if (associatedFiles.length === 0) {
+                        console.warn(
+                            `Warning: No associated files (.dat, .map, .id, .ind) found for ${tabFile.path}. Conversion may fail.`,
+                        );
+                    }
+
+                    // Convert TAB to GeoJSON
+                    const geoJson = await processTabFile(tabFilePath, tabFile.path, file.originalFilename);
+                    geoJsons.push(geoJson);
+                }
+            } else {
+                // Single TAB file
+                const tabFilePath = path.join(tempDir, file.originalFilename);
+                await fs.writeFile(tabFilePath, file.buffer);
+                console.warn(
+                    `Processing single TAB file (${file.originalFilename}) without associated files. Conversion may fail.`,
+                );
+
+                // Convert TAB to GeoJSON
+                const geoJson = await processTabFile(tabFilePath, file.originalFilename, file.originalFilename);
+                geoJsons.push(geoJson);
+            }
+
+            // Clean up temporary files
+            await fs.remove(tempDir);
+            resolve(geoJsons);
+        } catch (error) {
+            await fs.remove(path.join(__dirname, 'temp'));
+            reject(new Error(`Failed to convert TAB to GeoJSON: ${error.message}`));
+        }
+    });
+};
+
+// Helper function to process a single TAB file
+async function processTabFile(tabFilePath: string, tabFileName: string, originalFilename: string): Promise<IGeoJson> {
+    let dataset: gdal.Dataset;
+    try {
+        dataset = gdal.open(tabFilePath);
+    } catch (err) {
+        throw new Error(
+            `GDAL failed to open ${tabFileName}: ${err.message}. Ensure all associated files (.dat, .map, .id, .ind) are present.`,
+        );
+    }
+
+    if (dataset.layers.count() === 0) {
+        dataset.close();
+        throw new Error(`No layers found in ${tabFileName}`);
+    }
+
+    const layer = dataset.layers.get(0);
+    const features: IFeature[] = [];
+
+    layer.features.forEach((feature) => {
+        const geometry = feature.getGeometry();
+        const geojsonGeometry = geometry ? geometry.toObject() : { type: 'GeometryCollection', geometries: [] };
+        const properties = feature.fields.toObject();
+        const featureId = uuidv4();
+        const featureName = properties.name || path.basename(tabFileName, '.tab') || 'United_Layer';
+
+        features.push({
+            id: featureId,
+            parentId: 'root',
+            name: featureName,
+            geometry: geojsonGeometry as any,
+            properties: {
+                name: featureName,
+                ...properties,
+            },
+            type: 'Feature',
+        });
+    });
+
+    dataset.close();
+
+    return {
+        name: path.basename(originalFilename, path.extname(originalFilename)) || 'United_Folder',
+        folders: [
+            {
+                name: 'root',
+                id: 'root',
+                children: [],
+                files: [],
+            },
+        ],
+        features,
+        styles: {},
+    };
+}
+
+const FILE_SUPPORTS = {
+    KMZ: 'kmz',
+    KML: 'kml',
+    CSV: 'csv',
+    XLSX: 'xlsx',
+    TAB: 'zip', //(Tab includes .dat,.map,.id',.ind,.tab file)
+};
+
+const FILE_CONVERTER = {
+    [FILE_SUPPORTS.KML]: convertFileKMLToGeoJSON,
+    [FILE_SUPPORTS.KMZ]: convertFileKMZToGeoJSON,
+    [FILE_SUPPORTS.CSV]: convertFileCSVToGeoJSON,
+    [FILE_SUPPORTS.XLSX]: convertFileXLSXToGeoJSON,
+    [FILE_SUPPORTS.TAB]: convertFileTabToGeoJSON,
+};
+
+export const convertFileUploadToObjects = (files: MemoryStorageFile[]): Promise<IGeoJson[]> => {
+    return new Promise((resolve, reject) => {
+        const promises = Array.from(files)
+            .filter((file) => {
+                const ext = file.originalFilename.split('.').pop();
+                return ext && Object.values(FILE_SUPPORTS).includes(ext.toLowerCase());
+            })
+            .map((file) => {
+                const ext = file.originalFilename.split('.').pop()?.toLowerCase();
+                const converter = FILE_CONVERTER[ext as keyof typeof FILE_SUPPORTS];
+                if (converter) {
+                    return converter(file).then((result: IGeoJson | IGeoJson[]) => {
+                        // Normalize output to IGeoJson[]
+                        return Array.isArray(result) ? result : [result];
+                    });
+                }
+                return Promise.resolve([] as IGeoJson[]);
+            })
+            .filter((p) => p !== undefined);
+
+        Promise.all(promises)
+            .then((results) => resolve(results.flat())) // Flatten all GeoJSON arrays
+            .catch(reject);
+    });
+};
+
+export const exportKmlFolders = (data: UserObject[], parentId: string, dataDetail: UserObjectDetail[]): Folder[] => {
+    return data
+        .filter((e) => e.parentId === parentId)
+        .map((e) => ({
+            type: 'folder',
+            meta: {
+                name: String(e.name || 'United_Folder_' + Math.random()),
+            },
+            children: [
+                ...exportKmlFolders(data, e.id, dataDetail),
+                ...convertToFeature(dataDetail.filter((detail) => detail.userObjectId === e.id)),
+            ],
+        }));
+};
+
+export const convertToFeature = (data: UserObjectDetail[]): F[] => {
+    return data.map((e) => ({
+        type: 'Feature',
+        geometry: e.data.geometry as Geometry,
+        id: String(e.name || 'United_Feature_' + Math.random()),
+        properties: e.data.properties as GeoJsonProperties,
+    }));
+};
+
+export const exportToRoot = (
+    userObjects: UserObject[],
+    userObjectDetails: UserObjectDetail[],
+    parentId: string,
+): tj.Root => {
+    const childRoot = userObjects.find((e) => e.parentId === parentId && e.name === 'root');
+
+    const filteredUO = childRoot ? userObjects.filter((e) => e.id !== childRoot.id) : userObjects;
+    const children = exportKmlFolders(filteredUO, parentId, userObjectDetails);
+
+    const detailRoot = convertToFeature(userObjectDetails.filter((e) => e.userObjectId === parentId));
+
+    if (childRoot) {
+        children.push(...exportKmlFolders(userObjects, childRoot.id, userObjectDetails));
+        detailRoot.push(
+            ...convertToFeature(userObjectDetails.filter((detail) => detail.userObjectId === childRoot.id)),
+        );
+    }
+
+    return {
+        type: 'root',
+        children: [...children, ...detailRoot],
+    };
+};
+// SMART FEATURE
+export const parseGeometryWKT = (wkt?: string): Geometry => {
+    if (!wkt) {
+        return {
+            type: 'GeometryCollection',
+            geometries: [],
+        };
+    }
+
+    // Regex patterns for different geometry types
+    const regexPatterns: Record<string, RegExp> = {
+        POINT: /^POINT\s*\((\d+(\.\d+)?\s+\d+(\.\d+)?)\)$/,
+        MULTIPOINT: /^MULTIPOINT\s*\(\((.*?)\)\)$/,
+        LINESTRING: /^LINESTRING\s*\((.*?)\)$/,
+        MULTILINESTRING: /^MULTILINESTRING\s*\(\((.*?)\)\)$/,
+        POLYGON: /^POLYGON\s*\(\((.*?)\)\)$/,
+        MULTIPOLYGON: /^MULTIPOLYGON\s*\(\(\((.*?)\)\)\)$/,
+    };
+
+    // Determine geometry type
+    for (const [type, regex] of Object.entries(regexPatterns)) {
+        const match = wkt.match(regex);
+
+        if (match) {
+            switch (type) {
+                case 'POINT': {
+                    const [lng, lat] = match[1].split(' ').map(Number);
+                    return {
+                        type: 'Point',
+                        coordinates: [lng, lat],
+                    };
+                }
+                case 'MULTIPOINT': {
+                    const coordinates = match[1]
+                        .split('), (')
+                        .map((point) => point.replace(/[()]/g, '').split(' ').map(Number));
+                    return {
+                        type: 'MultiPoint',
+                        coordinates,
+                    };
+                }
+                case 'LINESTRING': {
+                    const coordinates = match[1].split(', ').map((coord) => coord.split(' ').map(Number));
+                    return {
+                        type: 'LineString',
+                        coordinates,
+                    };
+                }
+                case 'MULTILINESTRING': {
+                    const coordinates = match[1].split('), (').map((line) =>
+                        line
+                            .replace(/[()]/g, '')
+                            .split(', ')
+                            .map((coord) => coord.split(' ').map(Number)),
+                    );
+                    return {
+                        type: 'MultiLineString',
+                        coordinates,
+                    };
+                }
+                case 'POLYGON': {
+                    const coordinates = match[1].split('), (').map((ring) =>
+                        ring
+                            .replace(/[()]/g, '')
+                            .split(', ')
+                            .map((coord) => coord.split(' ').map(Number)),
+                    );
+                    return {
+                        type: 'Polygon',
+                        coordinates,
+                    };
+                }
+                case 'MULTIPOLYGON': {
+                    const coordinates = match[1].split(')), ((').map((polygon) =>
+                        polygon
+                            .replace(/[()]/g, '')
+                            .split('), (')
+                            .map((ring) => ring.split(', ').map((coord) => coord.split(' ').map(Number))),
+                    );
+                    return {
+                        type: 'MultiPolygon',
+                        coordinates,
+                    };
+                }
+                default:
+                    throw new Error(`Unsupported WKT type: ${type}`);
+            }
+        }
+    }
+
+    return {
+        type: 'GeometryCollection',
+        geometries: [],
+    };
+};
+
+const SMART_FEATURE_FILE_SUPPORTS = {
+    KMZ: '.kmz',
+    KML: '.kml',
+};
+
+async function streamToBuffer(stream: Stream): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        stream.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+        stream.on('end', () => resolve(Buffer.concat(chunks)));
+        stream.on('error', reject);
+    });
+}
+
+export const smartFeatureConvertFileKMZToGeoJSON = (file: unzipper.File, folderId: string): Promise<IGeoJson> => {
+    return new Promise(async (resolve, reject) => {
+        const buffer = await streamToBuffer(file.stream());
+        const zip = new JSZip();
+        zip.loadAsync(buffer).then((zip) => {
+            const kmlFile = Object.values(zip.files).find((f) => f.name.endsWith('.kml'));
+            if (!kmlFile) {
+                reject(new Error('KML file not found in KMZ'));
+                return;
+            }
+            kmlFile.async('text').then((content) =>
+                resolve({
+                    name: file.path.split('/').pop() ?? '',
+                    ...convertStringKmlToMyObject(content, folderId),
+                }),
+            );
+        });
+    });
+};
+
+export const smartFeatureConvertFileKMLToGeoJSON = (file: unzipper.File, folderId: string): Promise<IGeoJson> => {
+    return new Promise(async (resolve, reject) => {
+        try {
+            const buffer = await streamToBuffer(file.stream());
+            const content = buffer.toString();
+            resolve({
+                name: file.path.split('/').pop() ?? '',
+                ...convertStringKmlToMyObject(content, folderId),
+            });
+        } catch (error) {
+            reject(new Error(`Failed to convert KML to GeoJSON: ${error.message}`));
+        }
+    });
+};
+
+const SMART_FEATURE_FILE_CONVERTER = {
+    [SMART_FEATURE_FILE_SUPPORTS.KMZ]: smartFeatureConvertFileKMZToGeoJSON,
+    [SMART_FEATURE_FILE_SUPPORTS.KML]: smartFeatureConvertFileKMLToGeoJSON,
+};
+
+const buildTreeFolder = (files: string[], ignoreFolders: string[]): IFolder => {
+    const root: IFolder = { id: 'root', name: 'root', children: [], files: [] };
+
+    files.forEach((file: string) => {
+        const parts = file.split('/');
+        let currentNode = root;
+
+        // Ignore folders
+        if (ignoreFolders.some((ignore) => file.includes(ignore + '/') || (file + '/').includes(ignore + '/'))) {
+            return;
+        }
+
+        parts.forEach((part) => {
+            if (!part) return;
+
+            if (!currentNode.children) {
+                currentNode.children = [];
+            }
+
+            let childNode = currentNode.children.find((child) => child.name === part);
+
+            if (!childNode) {
+                const folderId = String(file);
+                childNode = { name: part, id: folderId, children: [], files: [] };
+                currentNode.children.push(childNode);
+            }
+
+            currentNode = childNode;
+        });
+    });
+
+    return root;
+};
+
+export const convertSmartFeatureToObject = async (
+    zipPath: string,
+    userObjectName: string,
+    smType: SmartFeatureArnoTypeEnum | SmartFeatureArnpTypeEnum,
+    type: UserObjectType.ARNO | UserObjectType.ARNP,
+): Promise<IGeoJson> => {
+    try {
+        const ignoreFiles: string[] = [
+            // 'KcnAndonPolygon___DNST_AN_HAI_BAC_20241005_20241007/Bin_10/KcnAndonPolygon___DNST_AN_HAI_BAC_TopCells_10_20241005_20241007.csv',
+        ];
+        const ignoreFolders: string[] = ['Footprints', 'csv'];
+
+        const directory = await unzipper.Open.file(zipPath);
+
+        // Build directory structure
+        const directories = new Set<string>();
+        directory.files.forEach((file) => {
+            const parts = file.path.split('/'); // Split the path by '/'
+            parts.pop(); // Remove the file name to keep only the directory parts
+
+            let currentPath = '';
+            parts.forEach((part) => {
+                currentPath = currentPath ? `${currentPath}/${part}` : part;
+                directories.add(currentPath);
+            });
+        });
+
+        // Collect results from all valid files
+        const features: any[] = [];
+        const styles: any[] = [];
+
+        for (const file of directory.files) {
+            const isDirectory = file.type === 'Directory';
+            const ext = path.extname(file.path).toLowerCase();
+            const filePath = file.path;
+
+            const isIgnored =
+                ignoreFolders.some((ignore) => filePath.includes(ignore + '/')) ||
+                ignoreFiles.some((ignore) => file.path.endsWith(ignore));
+
+            if (
+                !isDirectory &&
+                ext &&
+                Object.values(SMART_FEATURE_FILE_SUPPORTS).includes(ext.toLowerCase()) &&
+                !isIgnored &&
+                (type == UserObjectType.ARNO
+                    ? filePath.includes(smType)
+                    : filePath.includes(smType) || filePath.includes('threshold'))
+            ) {
+                const converter = SMART_FEATURE_FILE_CONVERTER[ext as keyof typeof SMART_FEATURE_FILE_SUPPORTS];
+
+                if (converter) {
+                    try {
+                        const folderId =
+                            filePath.split('/').slice(0, -1).join('/') != ''
+                                ? filePath.split('/').slice(0, -1).join('/')
+                                : 'root';
+                        const result = await converter(file, folderId);
+                        // Assuming result is of type IGeoJson or similar with features and styles
+                        if (result.features && Array.isArray(result.features)) {
+                            features.push(...result.features);
+                        }
+                        if (result.styles && Array.isArray(result.styles)) {
+                            styles.push(...result.styles);
+                        }
+                    } catch (error) {
+                        console.error(`Lỗi khi xử lý file ${file.path}:`, error);
+                    }
+                }
+            }
+        }
+
+        const folderRoot = buildTreeFolder(Array.from(directories), ignoreFolders);
+        return {
+            features,
+            styles: styles as any,
+            name: userObjectName,
+            folders: [folderRoot],
+        };
+    } catch (error) {
+        throw new Error('Failed to convert smart feature to object: ' + error.message);
+    }
+};

@@ -1,0 +1,29 @@
+curl 'https://drive.usercontent.google.com/download?id=1nBk-pgzhDSPPgsI8N3riRJhXeehYzv_5&export=download&confirm=t&uuid=08f03a85-964c-411b-bdac-ea249c775286' \
+  -H 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7' \
+  -H 'accept-language: vi-VN,vi;q=0.9' \
+  -H 'cache-control: no-cache' \
+  -H 'cookie: NID=520=MJs0P5srLNPj_nbPu5QA5LhY_CrTg9YYWoM9L4rgNkJ7OUld_Hk6Pb6ZocJ_mWqPpkrFxJd1lQoD6cRWUhamrwne0HVwXHDx_9hBQO2MBPjJkPtyA0cOgkTo5MDdzXNidd2WB6AYG_kJcQ3I9ku1RNUDLmZSp7mOtgKe99ujgDyHi3ju_D8F971CyeX6K2nSGgI' \
+  -H 'dnt: 1' \
+  -H 'pragma: no-cache' \
+  -H 'priority: u=0, i' \
+  -H 'sec-ch-ua: "Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"' \
+  -H 'sec-ch-ua-arch: "x86"' \
+  -H 'sec-ch-ua-bitness: "64"' \
+  -H 'sec-ch-ua-form-factors: "Desktop"' \
+  -H 'sec-ch-ua-full-version: "131.0.6778.265"' \
+  -H 'sec-ch-ua-full-version-list: "Google Chrome";v="131.0.6778.265", "Chromium";v="131.0.6778.265", "Not_A Brand";v="24.0.0.0"' \
+  -H 'sec-ch-ua-mobile: ?0' \
+  -H 'sec-ch-ua-model: ""' \
+  -H 'sec-ch-ua-platform: "macOS"' \
+  -H 'sec-ch-ua-platform-version: "14.5.0"' \
+  -H 'sec-ch-ua-wow64: ?0' \
+  -H 'sec-fetch-dest: document' \
+  -H 'sec-fetch-mode: navigate' \
+  -H 'sec-fetch-site: cross-site' \
+  -H 'sec-fetch-user: ?1' \
+  -H 'upgrade-insecure-requests: 1' \
+  -H 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' \
+  -H 'x-browser-channel: stable' \
+  -H 'x-browser-copyright: Copyright 2025 Google LLC. All rights reserved.' \
+  -H 'x-browser-validation: ML+Ko0QpRXQS2gN7CwuA69q1mXA=' \
+  -H 'x-browser-year: 2025' --output mlmt-map.docker.tar && sh reload-mlmt.sh 

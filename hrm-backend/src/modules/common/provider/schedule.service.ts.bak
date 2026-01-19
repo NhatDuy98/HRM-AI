@@ -1,0 +1,137 @@
+import { HttpService } from '@nestjs/axios';
+import { InjectQueue } from '@nestjs/bullmq';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { forwardRef, Inject, Injectable } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
+import { Queue } from 'bullmq';
+import { Cache } from 'cache-manager';
+import { firstValueFrom } from 'rxjs';
+import { AuthService } from '../../auth/service';
+import { SyncService } from '../../sync/service';
+import { SystemObjectService } from '../../system-object/service';
+import { decryptData } from '../utils/encrypt.util';
+import { QUEUE_JOBS, QUEUES } from '../utils/enum.util';
+import { AppLogger } from '../utils/logger.util';
+import { MakeClusterJobData } from './cluster.processor';
+
+@Injectable()
+export class ScheduleService {
+    constructor(
+        @Inject(CACHE_MANAGER) private cacheManager: Cache,
+        private readonly httpService: HttpService,
+        @Inject(forwardRef(() => AuthService))
+        private readonly authService: AuthService,
+        @Inject(forwardRef(() => SystemObjectService))
+        private readonly systemObjectService: SystemObjectService,
+        private readonly logger: AppLogger,
+        @InjectQueue(QUEUES.CLUSTER_QUEUE) private clusterQueue: Queue,
+        private readonly syncService: SyncService,
+    ) {}
+
+    async getKeyAndHashBody(key: any): Promise<{ url: string; hashBody: string }> {
+        const parts = key.split('_');
+        let url = '';
+        let userId = '';
+        let hashBody = '';
+
+        if (key.includes('user:')) {
+            const userPart = parts.find((part: any) => part.startsWith('user:'));
+            userId = userPart ? userPart.replace('user:', '') : '';
+            const urlAndHash = key.split(`${userId}_`)[1];
+            url = urlAndHash.split('_')[0];
+            hashBody = urlAndHash.slice(url.length + 1);
+        } else {
+            url = parts[1];
+            hashBody = parts.slice(2).join('');
+        }
+
+        return {
+            url,
+            hashBody,
+        };
+    }
+
+    // UTC time
+    @Cron('0 15 * * *')
+    async seedDGHC() {
+        await this.syncService.seedDGHC();
+    }
+
+    // UTC time
+    @Cron('0 17 * * *')
+    async clearCacheSystemObject() {
+        this.logger.log('[CronJob - clearCacheSystemObject] Start clear cache');
+
+        const keys: string[] = await this.cacheManager.store.keys();
+
+        const bearerToken = await this.authService.getAccessToken();
+        const keysToDelete = keys.filter((key) => key.startsWith('SystemObject'));
+        for (const key of keysToDelete) {
+            const { url, hashBody } = await this.getKeyAndHashBody(key);
+            await this.cacheManager.del(key);
+
+            try {
+                //@ts-ignore
+                const response = await firstValueFrom(
+                    this.httpService.post(
+                        `${process.env.BASE_URL}` + url,
+                        {
+                            ...JSON.parse(decryptData(hashBody)),
+                        },
+                        {
+                            headers: {
+                                Authorization: `Bearer ${bearerToken}`,
+                            },
+                        },
+                    ),
+                );
+                // console.log(response);
+            } catch (error) {
+                this.logger.error(`[CronJob - clearCacheSystemObject] ${error}`);
+            }
+        }
+
+        this.logger.log('[CronJob - clearCacheSystemObject] Cache refill completed.');
+    }
+
+    // UTC time
+    @Cron('0 16 * * *')
+    async makeCluster() {
+        try {
+            this.logger.log('[CronJob - makeCluster] Start make cluster.');
+
+            // Check if there are any active or waiting MAKE_CLUSTER jobs
+            const activeJobs = await this.clusterQueue.getActive();
+            const waitingJobs = await this.clusterQueue.getWaiting();
+            const makeClusterJobsPending = [...activeJobs, ...waitingJobs].some(
+                (job) => job.name === QUEUE_JOBS.MAKE_CLUSTER,
+            );
+
+            if (makeClusterJobsPending) {
+                this.logger.log(
+                    '[CronJob - makeCluster] Skipped adding new jobs: Existing MAKE_CLUSTER jobs are still pending.',
+                );
+                return;
+            }
+            const systemObjects = await this.systemObjectService.findAllCluster();
+            for (const obj of systemObjects) {
+                if (!obj?.queryNote) {
+                    this.logger.warn(`[CronJob - makeCluster] Skipped invalid object: ${JSON.stringify(obj)}`);
+                    continue;
+                }
+
+                const payload: MakeClusterJobData = {
+                    id: obj.id,
+                    dataType: obj.type,
+                    dateColumn: obj.dateColumn,
+                    queryNote: obj.queryNote,
+                    updatedAt: new Date().toISOString(),
+                    bin10KeyValue: obj.bin10KeyValue ?? 'RSRP',
+                };
+                await this.clusterQueue.add(QUEUE_JOBS.MAKE_CLUSTER, payload);
+            }
+        } catch (error) {
+            this.logger.error(`[CronJob - makeCluster]: ${error.message}`);
+        }
+    }
+}

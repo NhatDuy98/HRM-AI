@@ -1,0 +1,230 @@
+import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { Inject, NotFoundException } from '@nestjs/common';
+import { InjectDataSource } from '@nestjs/typeorm';
+import { Job } from 'bullmq';
+import { Cache } from 'cache-manager';
+import path from 'path';
+import Piscina from 'piscina';
+import { DataSource, IsNull } from 'typeorm';
+import { QUEUE_JOBS, QUEUES } from '../utils';
+import { AppLogger } from '../utils/logger.util';
+import { filename } from './worker/worker';
+import { v4 as uuidv4 } from 'uuid';
+import { SystemObjectService } from '../../system-object/service';
+
+export interface MakeClusterJobData {
+    id: string;
+    dataType: string;
+    dateColumn?: string;
+    queryNote: string;
+    updatedAt: string;
+    bin10KeyValue: string;
+    date?: string;
+}
+
+const MAX_CLUSTER_ZOOM = 11;
+const MIN_CLUSTER_ZOOM = 1;
+
+// Initialize Piscina worker pool
+const piscina = new Piscina({
+    filename: path.resolve(__dirname, 'worker/workerWrapper.js'),
+    workerData: {
+        fullpath: filename,
+        maxZoom: MAX_CLUSTER_ZOOM,
+        minZoom: MIN_CLUSTER_ZOOM,
+    },
+    resourceLimits: {
+        maxOldGenerationSizeMb: 1024 * 6, // 6GB
+    },
+    minThreads: 1,
+    maxThreads: 1,
+});
+
+export const makeClusterCacheName = (id: string, zoom: number, date?: string) => {
+    const sample = `MLMT_RESULT.${QUEUE_JOBS.MAKE_CLUSTER}:_${id}-zoom-${zoom}`;
+    if (date) {
+        return `${sample}-${date}`;
+    }
+    return sample;
+};
+
+@Processor(QUEUES.CLUSTER_QUEUE, {
+    concurrency: 1,
+})
+export class ClusterConsumer extends WorkerHost {
+    constructor(
+        @Inject(CACHE_MANAGER) private cacheManager: Cache,
+        @InjectDataSource('appConnection')
+        private dataSource: DataSource,
+        private readonly systemObjectService: SystemObjectService,
+        private readonly logger: AppLogger,
+    ) {
+        super();
+    }
+
+    async process(job: Job, token?: string): Promise<any> {
+        this.logger.log(`[ClusterConsumer] process job ${job.name}, attemp ${job.attemptsMade}`);
+        switch (job.name) {
+            case QUEUE_JOBS.MAKE_CLUSTER:
+                return this.makeClusterJob(job.data);
+            default:
+                throw new Error('No job name matched');
+        }
+    }
+
+    async makeClusterJob(data: MakeClusterJobData) {
+        const queryRunner = this.dataSource.createQueryRunner();
+        try {
+            const { id, dataType, queryNote, dateColumn, bin10KeyValue, date } = data;
+            const systemObject = await this.systemObjectService.getRepository().findOneBy({
+                id: id,
+                deletedAt: IsNull(),
+            });
+
+            if (!systemObject) {
+                throw new NotFoundException(`SystemObject with id ${id} not found.`);
+            }
+
+            this.logger.log(`[ClusterConsumer] makeClusterJob with data ${JSON.stringify(data, null, 2)}`);
+            let whereClause = '';
+            if (dateColumn) {
+                const [startDateColumn, endDateColumn] = dateColumn.split(';');
+                if (date) {
+                    whereClause =
+                        startDateColumn && endDateColumn && systemObject.dateRange
+                            ? `
+                    WHERE TRUNC(${startDateColumn}) <= TRUNC(TO_DATE('${date}', 'YYYY-MM-DD'))
+                    AND TRUNC(${endDateColumn}) >= TRUNC(TO_DATE('${date}', 'YYYY-MM-DD'))
+                `
+                            : `
+                    WHERE TRUNC(${startDateColumn}) = TRUNC(TO_DATE('${date}', 'YYYY-MM-DD'))
+                `;
+                } else {
+                    whereClause = `
+                WHERE ${startDateColumn} >= (
+                    SELECT TRUNC(MAX(${startDateColumn})) FROM base_query
+                )
+            `;
+                }
+            }
+
+            const withQuery = `
+                WITH base_query AS (
+                    ${queryNote}
+                )
+                SELECT
+                    *
+                FROM base_query
+                ${whereClause}
+            `;
+
+            // Stream query results using TypeORM
+            await queryRunner.connect();
+            this.logger.log(`[ClusterConsumer] query ${withQuery}`);
+            const stream = await queryRunner.stream(withQuery);
+
+            // Process stream in batches
+            const BATCH_SIZE = 50000;
+            let batch: any[] = [];
+            let count = 0;
+
+            for await (const row of stream) {
+                batch.push(row);
+                if (batch.length >= BATCH_SIZE) {
+                    await piscina.run({ dataType, rows: batch, type: 'add', bin10KeyValue });
+                    count = count + BATCH_SIZE;
+                    batch = [];
+                }
+            }
+
+            // Process any remaining rows
+            if (batch.length > 0) {
+                await piscina.run({ dataType, rows: batch, type: 'add', bin10KeyValue });
+                count = count + batch.length;
+                this.logger.log(
+                    `[ClusterConsumer] id ${id} load ${count} records, sample record ${JSON.stringify(
+                        batch[0],
+                        null,
+                        2,
+                    )}`,
+                );
+                batch = [];
+            }
+            await piscina.run({ dataType, type: 'load', bin10KeyValue });
+
+            // Retrieve clusters from worker and cache them
+            const clusters = await piscina.run({ dataType, type: 'get-clusters', bin10KeyValue });
+            for (let zoom = MIN_CLUSTER_ZOOM; zoom <= MAX_CLUSTER_ZOOM; zoom++) {
+                const processedClusters = this.processClusters(clusters[zoom]);
+                await this.cacheManager.set(makeClusterCacheName(id, zoom, date), processedClusters);
+            }
+
+            this.logger.log(`[ClusterConsumer] for id ${id} process completed`);
+        } catch (error) {
+            console.log(error);
+            this.logger.error(`[ClusterConsumer] ${error}`);
+            throw error; // Re-throw to allow BullMQ to handle retries
+        } finally {
+            await queryRunner.release();
+            await piscina.destroy(); // Destroy pool to free resources
+        }
+    }
+
+    processClusters(clusters: any[]): any[] {
+        return clusters.map((item) => {
+            if (item.properties.histogram && item.properties.point_count) {
+                const median = this.approximateMedian(item.properties.histogram, item.properties.point_count);
+                const { histogram, ...restProperties } = item.properties; // Loại bỏ histogram
+                return {
+                    ...item,
+                    properties: {
+                        ...restProperties,
+                        median,
+                        mean: item.properties.mean,
+                    },
+                };
+            } else {
+                // Handle single point (non-clustered)
+                const id = uuidv4();
+                const value =
+                    typeof item?.properties?.data?.VALUE === 'number'
+                        ? item?.properties?.data?.VALUE
+                        : parseFloat(item?.properties?.data?.VALUE) || 0;
+                return {
+                    ...item,
+                    id: uuidv4(),
+                    type: 'Feature',
+                    properties: {
+                        ...item.properties,
+                        cluster: true,
+                        cluster_id: id,
+                        median: value.toFixed(2),
+                        mean: value.toFixed(2),
+                        point_count: 1, // Single point
+                        point_count_abbreviated: 1,
+                    },
+                };
+            }
+        });
+    }
+
+    // Hàm tính median gần đúng từ histogram
+    approximateMedian(histogram: Record<number, number>, totalCount: number): number {
+        const sortedBins = Object.entries(histogram)
+            .map(([bin, count]) => [parseFloat(bin), count] as [number, number])
+            .sort((a, b) => a[0] - b[0]);
+
+        let cumulativeCount = 0;
+        const target = totalCount / 2;
+
+        for (const [bin, count] of sortedBins) {
+            cumulativeCount += count;
+            if (cumulativeCount >= target) {
+                return bin;
+            }
+        }
+
+        return sortedBins[sortedBins.length - 1]?.[0] || 0;
+    }
+}

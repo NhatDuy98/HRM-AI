@@ -1,0 +1,164 @@
+import { InjectQueue } from '@nestjs/bullmq';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import {
+    BadRequestException,
+    Body,
+    Controller,
+    Delete,
+    forwardRef,
+    Inject,
+    NotFoundException,
+    Param,
+    ParseIntPipe,
+    Post,
+} from '@nestjs/common';
+import { ApiBody, ApiOperation } from '@nestjs/swagger';
+import { Queue } from 'bullmq';
+import { Cache } from 'cache-manager';
+import { SystemObjectService } from '../../system-object/service';
+import { CacheService } from '../cache/services/cache.service';
+import { GetClusterDto } from '../dto/get-cluster.dto';
+import { makeClusterCacheName, MakeClusterJobData } from '../provider/cluster.processor';
+import { QUEUE_JOBS, QUEUES } from '../utils';
+import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
+import { EventEnum, InitClusterEvent } from '../utils/event.util';
+import { AppLogger } from '../utils/logger.util';
+
+@Controller('redis')
+export class RedisController {
+    constructor(
+        private readonly cacheService: CacheService,
+        @Inject(CACHE_MANAGER) readonly cacheManager: Cache,
+        @Inject(forwardRef(() => SystemObjectService))
+        private readonly systemObjectService: SystemObjectService,
+        @InjectQueue(QUEUES.CLUSTER_QUEUE) private clusterQueue: Queue,
+        private eventEmitter: EventEmitter2,
+        private readonly logger: AppLogger,
+    ) {}
+
+    @Delete()
+    @ApiOperation({
+        summary: 'Delete Redis data start with key',
+    })
+    @ApiBody({
+        schema: {
+            type: 'object',
+            properties: {
+                key: {
+                    type: 'string',
+                    example: 'SystemObject',
+                },
+                token: { type: 'string', description: 'The admin token to authenticate the request.' },
+            },
+            required: ['key', 'token'],
+        },
+    })
+    async clearCache(@Body('key') key: string, @Body('token') token: string): Promise<any> {
+        // Validate the admin token
+        if (token !== process.env.ADMIN_TOKEN) {
+            throw new BadRequestException("You don't have permission to clear cache.");
+        }
+
+        try {
+            return this.cacheService.clearCache(key);
+        } catch (error) {
+            throw new BadRequestException(`Failed to clear cache: ${error.message}`);
+        }
+    }
+
+    @Post(':systemObjectId/:zoom/cluster')
+    async getCluster(
+        @Param('systemObjectId') systemObjectId: string,
+        @Param('zoom', ParseIntPipe) zoom: number,
+        @Body() data: GetClusterDto,
+    ) {
+        const cacheKey = makeClusterCacheName(systemObjectId, zoom, data.date);
+        const cache: any = await this.cacheManager.get(cacheKey);
+        if (!cache) {
+            this.eventEmitter.emit(EventEnum.INIT_CLUSTER, new InitClusterEvent({ systemObjectId, date: data.date }));
+        }
+        let clusters: any[] = cache ?? [];
+        if (data.boundaries && data.boundaries.length > 0) {
+            clusters = clusters.filter((cluster) => {
+                const [lng, lat] = cluster.geometry.coordinates;
+                // Check if the point lies within any of the provided boundaries
+                return data.boundaries.some(([minLng, minLat, maxLng, maxLat]) => {
+                    return lng >= minLng && lng <= maxLng && lat >= minLat && lat <= maxLat;
+                });
+            });
+        }
+
+        return clusters;
+    }
+
+    @ApiBody({
+        schema: {
+            type: 'object',
+            properties: {
+                token: { type: 'string', description: 'The admin token to authenticate the request.' },
+            },
+            required: ['token'],
+        },
+    })
+    @Post(':systemObjectId/init-cluster')
+    async initCluster(
+        @Param('systemObjectId') systemObjectId: string,
+        @Body('token') token: any,
+        @Body('date') date?: string,
+    ) {
+        if (token !== process.env.ADMIN_TOKEN) {
+            throw new BadRequestException("You don't have permission to init cluster.");
+        }
+        const systemObject = await this.systemObjectService.findByIdService(systemObjectId);
+        if (!systemObject) {
+            throw new NotFoundException();
+        }
+        const jobId = `make-cluster-${systemObject.id}-${date || 'no-date'}`; // Unique jobId
+        const existingJob = await this.clusterQueue.getJob(jobId);
+        if (existingJob) {
+            this.logger.log(`Job with ID ${jobId} already exists in queue. Skipping...`);
+            return false;
+        }
+
+        const payload: MakeClusterJobData = {
+            id: systemObject.id,
+            dataType: systemObject.type,
+            dateColumn: systemObject.dateColumn,
+            queryNote: systemObject.queryNote,
+            updatedAt: new Date().toISOString(),
+            bin10KeyValue: systemObject.bin10KeyValue ?? 'RSRP',
+            date: date,
+        };
+        await this.clusterQueue.add(QUEUE_JOBS.MAKE_CLUSTER, payload, { jobId });
+
+        return true;
+    }
+
+    @OnEvent(EventEnum.INIT_CLUSTER)
+    async initClusterEventHandler(data: InitClusterEvent) {
+        const systemObject = await this.systemObjectService.findByIdService(data.systemObjectId);
+        if (!systemObject) {
+            throw new NotFoundException();
+        }
+
+        const jobId = `make-cluster-${systemObject.id}-${data.date || 'no-date'}`; // Unique jobId
+        const existingJob = await this.clusterQueue.getJob(jobId);
+        if (existingJob) {
+            this.logger.log(`Job with ID ${jobId} already exists in queue. Skipping...`);
+            return false;
+        }
+
+        const payload: MakeClusterJobData = {
+            id: systemObject.id,
+            dataType: systemObject.type,
+            dateColumn: systemObject.dateColumn,
+            queryNote: systemObject.queryNote,
+            updatedAt: new Date().toISOString(),
+            bin10KeyValue: systemObject.bin10KeyValue ?? 'RSRP',
+            date: data.date,
+        };
+        await this.clusterQueue.add(QUEUE_JOBS.MAKE_CLUSTER, payload, { jobId });
+
+        return true;
+    }
+}

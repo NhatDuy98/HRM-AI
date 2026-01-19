@@ -1,0 +1,93 @@
+services:
+  oracle-db:
+    image: gvenzl/oracle-free:23-slim
+    container_name: oracle-db
+    mem_limit: 2.5g
+    restart: always
+    environment:
+      ORACLE_PASSWORD: oraclepassword
+      ORACLE_ALLOW_REMOTE: 'true'
+    ports:
+      - '1521:1521'
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+      - ./scripts:/container-entrypoint-initdb.d
+    networks:
+      - app_network
+
+  # oracle-db-warehouse:
+  #   image: gvenzl/oracle-free:23-slim
+  #   container_name: oracle-db-warehouse
+  #   mem_limit: 1g
+  #   environment:
+  #     ORACLE_PASSWORD: oraclepassword
+  #     ORACLE_ALLOW_REMOTE: 'true'
+  #   ports:
+  #     - '1522:1521'
+  #   volumes:
+  #     - oracle-db-warehouse-data:/opt/oracle/oradata
+  #     - ./scripts/warehouse:/container-entrypoint-initdb.d
+  #   networks:
+  #     - app_network
+
+  nest-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nest-app
+    mem_limit: 1g
+    restart: always
+    env_file: .env
+    working_dir: /app
+    volumes:
+      - ./migrations:/app/migrations
+    depends_on:
+      - oracle-db
+    ports:
+      - '5201:5201'
+    networks:
+      - app_network
+    
+  redis:
+    image: redis:alpine
+    ports:
+      - '6378:6379'
+    container_name: redis
+    restart: always
+    env_file:
+      - .env
+    networks:
+      - app_network
+
+  open-elevation:
+    image: openelevation/open-elevation
+    container_name: open-elevation
+    ports:
+      - "5202:8080"
+    volumes:
+      - ./data:/code/data
+    environment:
+      - TILE_FOLDER=/code/data
+    command: >
+      /bin/bash -c "
+      for f in /code/data/*.tif; do
+        if [ -f \"$f\" ]; then
+          echo \"Processing file: $f\" &&
+          /code/create-tiles.sh \"$f\" 10 10;
+        fi
+      done &&
+      python3 server.py"
+
+    restart: always
+    networks:
+      - app_network
+
+networks:
+  app_network:
+    external: true
+
+volumes:
+  oracle-db-warehouse-data:
+    driver: local
+  oracle-data:
+    driver: local
